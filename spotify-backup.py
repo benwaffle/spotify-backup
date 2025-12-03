@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 
-import argparse 
+import argparse
+import base64
 import codecs
-import http.client
 import http.server
 import json
 import logging
-import re
 import sys
 import time
 import urllib.error
@@ -63,18 +62,18 @@ class SpotifyAPI:
 	
 	# Pops open a browser window for a user to log in and authorize API access.
 	@staticmethod
-	def authorize(client_id, scope):
+	def authorize(client_id, client_secret, scope):
 		url = 'https://accounts.spotify.com/authorize?' + urllib.parse.urlencode({
-			'response_type': 'token',
+			'response_type': 'code',
 			'client_id': client_id,
 			'scope': scope,
 			'redirect_uri': 'http://127.0.0.1:{}/redirect'.format(SpotifyAPI._SERVER_PORT)
 		})
 		logging.info(f'Logging in (click if it doesn\'t open automatically): {url}')
 		webbrowser.open(url)
-	
-		# Start a simple, local HTTP server to listen for the authorization token... (i.e. a hack).
-		server = SpotifyAPI._AuthorizationServer('127.0.0.1', SpotifyAPI._SERVER_PORT)
+
+		# Start a simple, local HTTP server to listen for the authorization code... (i.e. a hack).
+		server = SpotifyAPI._AuthorizationServer('127.0.0.1', SpotifyAPI._SERVER_PORT, client_id, client_secret)
 		try:
 			while True:
 				server.handle_request()
@@ -86,34 +85,56 @@ class SpotifyAPI:
 	_SERVER_PORT = 43019
 	
 	class _AuthorizationServer(http.server.HTTPServer):
-		def __init__(self, host, port):
+		def __init__(self, host, port, client_id, client_secret):
+			self.client_id = client_id
+			self.client_secret = client_secret
 			http.server.HTTPServer.__init__(self, (host, port), SpotifyAPI._AuthorizationHandler)
-		
+
 		# Disable the default error handling.
 		def handle_error(self, request, client_address):
 			raise
 	
 	class _AuthorizationHandler(http.server.BaseHTTPRequestHandler):
 		def do_GET(self):
-			# The Spotify API has redirected here, but access_token is hidden in the URL fragment.
-			# Read it using JavaScript and send it to /token as an actual query string...
+			# The Spotify API has redirected here with authorization code in the query string.
 			if self.path.startswith('/redirect'):
-				self.send_response(200)
-				self.send_header('Content-Type', 'text/html')
-				self.end_headers()
-				self.wfile.write(b'<script>location.replace("token?" + location.hash.slice(1));</script>')
-			
-			# Read access_token and use an exception to kill the server listening...
-			elif self.path.startswith('/token?'):
 				self.send_response(200)
 				self.send_header('Content-Type', 'text/html')
 				self.end_headers()
 				self.wfile.write(b'<script>close()</script>Thanks! You may now close this window.')
 
-				access_token = re.search('access_token=([^&]*)', self.path).group(1)
-				logging.info(f'Received access token from Spotify: {access_token}')
-				raise SpotifyAPI._Authorization(access_token)
-			
+				# Parse the query string and extract the code parameter
+				parsed_url = urllib.parse.urlparse(self.path)
+				query_params = urllib.parse.parse_qs(parsed_url.query)
+
+				if 'code' not in query_params:
+					logging.error('Missing authorization code in response')
+					return
+
+				code = query_params['code'][0]
+				logging.info(f'Received authorization code from Spotify')
+
+				# Exchange the code for an access token
+				try:
+					auth_header = base64.b64encode(f'{self.server.client_id}:{self.server.client_secret}'.encode()).decode()
+					req = urllib.request.Request('https://accounts.spotify.com/api/token', data=urllib.parse.urlencode({
+						'grant_type': 'authorization_code',
+						'code': code,
+						'redirect_uri': f'http://127.0.0.1:{SpotifyAPI._SERVER_PORT}/redirect'
+					}).encode(), method='POST')
+					req.add_header('Authorization', f'Basic {auth_header}')
+					req.add_header('Content-Type', 'application/x-www-form-urlencoded')
+					res = urllib.request.urlopen(req)
+					reader = codecs.getreader('utf-8')
+					response = json.load(reader(res))
+					access_token = response['access_token']
+					logging.info('Successfully exchanged code for access token')
+					raise SpotifyAPI._Authorization(access_token)
+				except SpotifyAPI._Authorization:
+					raise
+				except Exception as err:
+					logging.error(f'Failed to exchange code for access token: {err}')
+
 			else:
 				self.send_error(404)
 		
